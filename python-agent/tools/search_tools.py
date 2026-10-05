@@ -88,3 +88,14 @@ def search_image(query: str) -> str:
         return f"[IMAGE_URL: {img_url}]\nFound image for '{title}'."
     except Exception as e:
         return f"Image search failed: {str(e)}"
+
+
+@tool
+def generate_image(prompt: str) -> str:
+    """Generates a new image from a text description using an AI image model.
+    Use this when the user asks to create, draw, generate, or make an image
+    of something, as opposed to finding an existing photo (use search_image for that)."""
+    # call Gemini Imagen / OpenAI images / etc., get back a URL or base64
+    ...
+    return f"[IMAGE_URL: {generated_url}]\nGenerated image for '{prompt}'."
+    

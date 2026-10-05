@@ -1,448 +1,498 @@
 import express, { Request, Response } from "express";
-import { config } from "./config.js";
-import { oauth2Client, getAuthUrl } from "./googleAuth.js";
-import { saveUserTokens, getUserTokens } from "./tokenStore.js";
-import { success_response } from "./Reponse/website-reponse.js";
 import axios from "axios";
+import dotenv from "dotenv";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import FormData from "form-data";
-import { createParser } from "eventsource-parser";
+import { createParser, type EventSourceMessage } from "eventsource-parser";
 
-const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL || "http://127.0.0.1:8000/api/agent/dispatch";
-const TELEGRAM_API_BASE = `https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}`;
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// ==========================================
-// MARKDOWN CONVERSION HELPERS
-// ==========================================
-// LLM agents write standard Markdown (**bold**, # Header, - bullets, etc).
-// Telegram's legacy "Markdown" parse_mode only understands *bold*, _italic_,
-// `code`, and [text](url) — anything else either renders literally (stray
-// ** characters visible to the user) or makes Telegram reject the message
-// with a 400 "can't parse entities" error. These two helpers convert LLM
-// Markdown into something Telegram can actually render, and provide a clean
-// plain-text fallback (instead of sending raw unconverted markup) if the
-// Markdown attempt still fails.
+const PORT = process.env.PORT || 3000;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL || "http://127.0.0.1:8000/api/agent/dispatch";
 
-function toTelegramMarkdown(text: string): string {
-  if (!text) return text;
-  let out = text;
+// Staging for inline human-in-the-loop approvals
+const pendingActions = new Map<string, { chatId: string | number; actionData: any; tokens: any }>();
 
-  // **bold** -> *bold*  (Telegram legacy bold is a single asterisk)
-  out = out.replace(/\*\*(.+?)\*\*/g, "*$1*");
+// ---------------------------------------------------------------------------
+// Decryption & Token Retrieval Engine
+// ---------------------------------------------------------------------------
 
-  // # Header / ## Header -> *Header* (bold line, since Telegram has no headers)
-  out = out.replace(/^#{1,6}\s+(.*)$/gm, "*$1*");
-
-  // "- item" or "* item" bullet markers -> "• item"
-  out = out.replace(/^[ \t]*[-*]\s+/gm, "• ");
-
-  // Collapse 3+ backtick code fences' language tag line (Telegram doesn't
-  // render language hints, just leave the fence as-is; safe no-op if absent)
-  return out;
-}
-
-function toPlainText(text: string): string {
-  if (!text) return text;
-  let out = text;
-
-  out = out.replace(/\*\*(.+?)\*\*/g, "$1"); // bold
-  out = out.replace(/\*(.+?)\*/g, "$1"); // bold (single)
-  out = out.replace(/_(.+?)_/g, "$1"); // italic
-  out = out.replace(/`{1,3}([^`]*)`{1,3}/g, "$1"); // inline/code block
-  out = out.replace(/^#{1,6}\s+/gm, ""); // headers
-  out = out.replace(/^[ \t]*[-*]\s+/gm, "• "); // bullets
-
-  return out;
-}
-
-// ==========================================
-// TELEGRAM UI & LOADER HELPERS
-// ==========================================
-
-// 1. Send native chat action (e.g. typing)
-async function sendChatAction(chatId: string | number, action = "typing"): Promise<void> {
+function decryptTokenString(cipherText: string): any {
   try {
-    await axios.post(`${TELEGRAM_API_BASE}/sendChatAction`, {
-      chat_id: chatId,
-      action: action,
-    });
+    const rawKey = process.env.ENCRYPTION_KEY || process.env.TOKEN_SECRET || process.env.JWT_SECRET || "";
+    if (!rawKey) {
+      console.warn("[AUTH WARNING] Missing ENCRYPTION_KEY in .env, attempting direct parse.");
+      return null;
+    }
+
+    const key = rawKey.length === 64
+      ? Buffer.from(rawKey, "hex")
+      : crypto.createHash("sha256").update(rawKey).digest();
+
+    const parts = cipherText.split(":");
+    if (parts.length !== 3) return null;
+
+    const [ivHex, authTagHex, encryptedHex] = parts;
+    const iv = Buffer.from(ivHex, "hex");
+    const authTag = Buffer.from(authTagHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(encryptedHex, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+
+    return JSON.parse(decrypted);
   } catch (err: any) {
-    console.error("Failed to send chat action:", err.response?.data || err.message);
+    console.error("[AUTH DECRYPT ERROR]:", err.message);
+    return null;
   }
 }
 
-// 2. Typing heartbeat to keep the indicator active throughout long tool calls
-function startTypingHeartbeat(chatId: string | number): () => void {
-  sendChatAction(chatId, "typing");
-  const intervalId = setInterval(() => {
-    sendChatAction(chatId, "typing");
-  }, 4000);
+function getStoredTokens(chatId: string | number): any {
+  try {
+    const candidatePaths = [
+      path.resolve(process.cwd(), "tokens.json"),
+      path.resolve(process.cwd(), "..", "tokens.json"),
+      path.resolve(__dirname, "..", "tokens.json"),
+      path.resolve(__dirname, "tokens.json"),
+    ];
 
-  return () => clearInterval(intervalId);
+    let tokenFilePath = "";
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        tokenFilePath = p;
+        break;
+      }
+    }
+
+    if (!tokenFilePath) {
+      console.warn("⚠️ tokens.json not found on disk.");
+      return {};
+    }
+
+    const raw = fs.readFileSync(tokenFilePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    const entry = parsed[String(chatId)] || parsed;
+
+    if (typeof entry === "string" && entry.includes(":")) {
+      const decrypted = decryptTokenString(entry);
+      if (decrypted) return decrypted;
+    }
+
+    if (typeof entry === "object" && entry !== null) {
+      return entry;
+    }
+
+    return {};
+  } catch (err: any) {
+    console.error("Failed to read tokens.json:", err.message);
+    return {};
+  }
 }
 
-// 3. Send an initial Telegram message (returns message_id for in-place editing)
+// ---------------------------------------------------------------------------
+// Telegram Message & Photo Helpers
+// ---------------------------------------------------------------------------
+
+function sanitizeMarkdown(text: string): string {
+  if (!text) return "";
+  let cleaned = text.replace(/^(\s*)-\s+/gm, "$1• ");
+
+  const boldCount = (cleaned.match(/\*\*/g) || []).length;
+  if (boldCount % 2 !== 0) cleaned += "**";
+
+  const italicCount = (cleaned.match(/(?<!\*)\*(?!\*)/g) || []).length;
+  if (italicCount % 2 !== 0) cleaned += "*";
+
+  return cleaned;
+}
+
 async function sendTelegramMessage(chatId: string | number, text: string): Promise<number | null> {
   try {
     const res = await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, {
       chat_id: chatId,
-      text: toTelegramMarkdown(text),
+      text: sanitizeMarkdown(text),
       parse_mode: "Markdown",
     });
     return res.data?.result?.message_id ?? null;
-  } catch (error: any) {
-    // Fallback to clean plain text (not raw unconverted markup) if entities fail to parse
+  } catch {
     try {
-      const res = await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, {
+      const fallback = await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, {
         chat_id: chatId,
-        text: toPlainText(text),
+        text,
       });
-      return res.data?.result?.message_id ?? null;
-    } catch (innerErr: any) {
-      console.error("Failed to send Telegram message:", innerErr.response?.data || innerErr.message);
+      return fallback.data?.result?.message_id ?? null;
+    } catch {
       return null;
     }
   }
 }
 
-// 4. In-place edit of an existing message (used to replace the loader with the answer)
-async function editTelegramMessage(
-  chatId: string | number,
-  messageId: number,
-  text: string
-): Promise<void> {
+async function editTelegramMessage(chatId: string | number, messageId: number, text: string): Promise<void> {
   try {
     await axios.post(`${TELEGRAM_API_BASE}/editMessageText`, {
       chat_id: chatId,
       message_id: messageId,
-      text: toTelegramMarkdown(text),
+      text: sanitizeMarkdown(text),
       parse_mode: "Markdown",
     });
-  } catch (error: any) {
-    // Fallback to clean plain text if Markdown parsing fails
+  } catch {
     try {
       await axios.post(`${TELEGRAM_API_BASE}/editMessageText`, {
         chat_id: chatId,
         message_id: messageId,
-        text: toPlainText(text),
+        text,
       });
-    } catch (innerErr: any) {
-      console.error("Failed to edit Telegram message:", innerErr.response?.data || innerErr.message);
+    } catch {
+      // Ignored: expired edit or unchanged content
     }
   }
 }
 
-// 5. Send photo to Telegram via URL
 async function sendTelegramPhoto(chatId: string | number, photoUrl: string, caption?: string): Promise<void> {
   try {
     await axios.post(`${TELEGRAM_API_BASE}/sendPhoto`, {
       chat_id: chatId,
       photo: photoUrl,
-      caption: caption ? toTelegramMarkdown(caption) : "",
+      caption: caption ? sanitizeMarkdown(caption) : undefined,
       parse_mode: "Markdown",
     });
   } catch (err: any) {
-    console.error("Failed to send Telegram photo:", err.response?.data || err.message);
-    // Fallback: retry without Markdown parse mode if entities failed
-    try {
-      await axios.post(`${TELEGRAM_API_BASE}/sendPhoto`, {
-        chat_id: chatId,
-        photo: photoUrl,
-        caption: caption ? toPlainText(caption) : "",
-      });
-    } catch (innerErr: any) {
-      console.error("Failed to send Telegram photo (fallback):", innerErr.response?.data || innerErr.message);
-    }
+    console.error("Failed to send remote photo:", err.response?.data || err.message);
   }
 }
 
-// 6. Send photo to Telegram from a base64 (or data URI) payload
-async function sendTelegramBase64Photo(
-  chatId: string | number,
-  base64Data: string,
-  caption?: string
-): Promise<void> {
+async function sendTelegramBase64Photo(chatId: string | number, base64DataUri: string, caption?: string): Promise<void> {
   try {
-    // Strip a data URI prefix like "data:image/png;base64," if present
-    const commaIndex = base64Data.indexOf(",");
-    const cleanBase64 =
-      base64Data.startsWith("data:") && commaIndex !== -1
-        ? base64Data.slice(commaIndex + 1)
-        : base64Data;
-
-    const buffer = Buffer.from(cleanBase64, "base64");
+    const base64Clean = base64DataUri.replace(/^data:image\/\w+;base64,/, "");
+    const imageBuffer = Buffer.from(base64Clean, "base64");
 
     const form = new FormData();
     form.append("chat_id", String(chatId));
-    if (caption) {
-      form.append("caption", toTelegramMarkdown(caption));
-      form.append("parse_mode", "Markdown");
-    }
-    form.append("photo", buffer, {
+    form.append("photo", imageBuffer, {
       filename: "image.png",
       contentType: "image/png",
     });
+    if (caption) {
+      form.append("caption", sanitizeMarkdown(caption));
+      form.append("parse_mode", "Markdown");
+    }
 
     await axios.post(`${TELEGRAM_API_BASE}/sendPhoto`, form, {
       headers: form.getHeaders(),
     });
   } catch (err: any) {
-    console.error("Failed to send Telegram base64 photo:", err.response?.data || err.message);
+    console.error("Failed to send base64 photo:", err.response?.data || err.message);
   }
 }
 
-// Helper: Download a Telegram file by file_id and return base64
-async function downloadTelegramFileAsBase64(fileId: string): Promise<string | null> {
+async function sendTelegramApprovalMessage(chatId: string | number, text: string, actionId: string): Promise<void> {
   try {
-    // 1. Get file path from Telegram
-    const fileRes = await axios.get(`${TELEGRAM_API_BASE}/getFile?file_id=${fileId}`);
-    const filePath = fileRes.data?.result?.file_path;
-    if (!filePath) return null;
-
-    // 2. Download the actual binary file
-    const downloadUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${filePath}`;
-    const audioRes = await axios.get(downloadUrl, { responseType: "arraybuffer" });
-
-    // 3. Convert buffer to base64
-    return Buffer.from(audioRes.data).toString("base64");
+    await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, {
+      chat_id: chatId,
+      text: sanitizeMarkdown(text),
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Send Email", callback_data: `confirm:${actionId}` },
+            { text: "❌ Cancel", callback_data: `cancel:${actionId}` },
+          ],
+        ],
+      },
+    });
   } catch (err: any) {
-    console.error("Failed to download Telegram voice file:", err.response?.data || err.message);
-    return null;
+    console.error("Failed to send approval keyboard:", err.response?.data || err.message);
   }
 }
 
-// ==========================================
-// HEALTH CHECK
-// ==========================================
-app.get("/health", (req: Request, res: Response) => {
-  res.status(200).json({ status: "healthy", timestamp: new Date().toISOString() });
-});
+async function answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+  await axios.post(`${TELEGRAM_API_BASE}/answerCallbackQuery`, {
+    callback_query_id: callbackQueryId,
+    text,
+  }).catch(() => {});
+}
 
-// ==========================================
-// 1. GOOGLE OAUTH 2.0 FLOW
-// ==========================================
-app.get("/auth/google/login", (req: Request, res: Response) => {
-  const chatId = req.query.chatId as string;
-  if (!chatId || chatId !== config.TELEGRAM_ALLOWED_USER_ID) {
-    res.status(401).send("Unauthorized chat ID");
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Agent Dispatch Pipeline with SSE & Coordinates
+// ---------------------------------------------------------------------------
 
-  const url = getAuthUrl(chatId);
-  res.redirect(url);
-});
+async function processUserPrompt(params: {
+  chatId: string | number;
+  promptText: string;
+  tokens: any;
+  audioPayload?: any;
+  imagePayload?: any;
+  locationPayload?: { latitude: number; longitude: number } | null;
+}): Promise<void> {
+  const { chatId, promptText, tokens, audioPayload, imagePayload, locationPayload } = params;
 
-app.get("/auth/google/callback", async (req: Request, res: Response): Promise<void> => {
-  const { code, state } = req.query;
-
-  if (!code || !state || typeof state !== "string" || typeof code !== "string") {
-    res.status(400).send("Invalid OAuth callback parameters.");
-    return;
-  }
-
-  const telegramChatId = state;
+  let loaderMessageId = await sendTelegramMessage(chatId, "⚡ Otis is thinking...");
 
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    saveUserTokens(telegramChatId, tokens);
-
-    await sendTelegramMessage(
-      telegramChatId,
-      "✅ *Otis has linked with Google Workspace!*"
-    );
-
-    res.send(success_response);
-  } catch (error: any) {
-    console.error("OAuth Exchange Error:", error.response?.data || error.message);
-    res.status(500).send("Failed to exchange code for tokens. Check server logs.");
-  }
-});
-
-// ==========================================
-// 2. TELEGRAM WEBHOOK ROUTE
-// ==========================================
-app.post("/webhook/telegram", async (req: Request, res: Response): Promise<void> => {
-  const incomingSecret = req.headers["x-telegram-bot-api-secret-token"];
-  if (incomingSecret !== config.TELEGRAM_WEBHOOK_SECRET) {
-    res.status(403).json({ error: "Forbidden" });
-    return;
-  }
-
-  res.sendStatus(200);
-
-  const update = req.body;
-  const message = update?.message;
-  if (!message) return;
-
-  const hasText = Boolean(message.text);
-  const hasLocation = Boolean(message.location);
-  const hasVoice = Boolean(message.voice);
-  const hasPhoto = Boolean(message.photo && message.photo.length > 0);
-
-  if (!hasText && !hasLocation && !hasVoice && !hasPhoto) return;
-
-  const senderId = String(message.from?.id);
-  const chatId = message.chat.id;
-
-  if (senderId !== config.TELEGRAM_ALLOWED_USER_ID) {
-    await sendTelegramMessage(chatId, "⛔ *Access Denied:* Otis is a private executive assistant.");
-    return;
-  }
-
-  const tokens = getUserTokens(senderId);
-  if (!tokens) {
-    const loginUrl = `${config.SERVER_PUBLIC_URL}/auth/google/login?chatId=${chatId}`;
-    await sendTelegramMessage(chatId, `⚠️ *Google authorization required.*\n\n🔗 [Link Google Workspace](${loginUrl})`);
-    return;
-  }
-
-  // 1. Initial status indicator
-  let loaderText = "⏳ *Thinking...*";
-  if (hasPhoto) loaderText = "🖼️ *Analyzing your image...*";
-  else if (hasVoice) loaderText = "🎙️ *Listening to your voice note...*";
-  else if (hasLocation) loaderText = "📍 *Reading your GPS coordinates...*";
-
-  const loaderMessageId = await sendTelegramMessage(chatId, loaderText);
-  const stopTyping = startTypingHeartbeat(chatId);
-
-  try {
-    let promptText = "";
-    let audioPayload: any = null;
-    let imagePayload: any = null;
-
-    if (hasPhoto) {
-      const highestResPhoto = message.photo[message.photo.length - 1];
-      const base64Img = await downloadTelegramFileAsBase64(highestResPhoto.file_id);
-      imagePayload = { data: base64Img, mime_type: "image/jpeg" };
-      promptText = message.caption ? message.caption.trim() : "Analyze this image and execute any relevant tools.";
-    } else if (hasVoice) {
-      const base64Audio = await downloadTelegramFileAsBase64(message.voice.file_id);
-      audioPayload = { data: base64Audio, mime_type: message.voice.mime_type || "audio/ogg" };
-      promptText = "The user sent a voice message. Execute requested actions and reply.";
-    } else if (hasLocation) {
-      promptText = `Location: lat=${message.location.latitude}, lon=${message.location.longitude}. Check weather.`;
-    } else {
-      promptText = message.text.trim();
-    }
-
-    // 2. Open an HTTP stream to the FastAPI SSE endpoint
     const streamResponse = await axios.post(
-      `${PYTHON_AGENT_URL}-stream`, // http://127.0.0.1:8000/api/agent/dispatch-stream
+      `${PYTHON_AGENT_URL}-stream`,
       {
         prompt: promptText,
         chat_id: String(chatId),
         google_tokens: tokens,
         audio: audioPayload,
         image: imagePayload,
+        location: locationPayload || undefined,
       },
-      { responseType: "stream" ,
-        timeout:200_000
-      }
+      { responseType: "stream" }
     );
 
     let finalReply = "";
-    let lastStatusText = loaderText;
+    let lastStatusText = "⚡ Otis is thinking...";
     let lastEditTimestamp = 0;
-    const RATE_LIMIT_MS = 1200; // Telegram message edit cooldown (avoids 429 errors)
+   const stagedApprovalHolder: { data: { action: any; text: string } | null } = { data: null };
+    const RATE_LIMIT_MS = 1200;
 
-    // Helper to safely update Telegram status with rate limiting
     const updateStatusSafe = async (newText: string) => {
       const now = Date.now();
       if (newText !== lastStatusText && now - lastEditTimestamp >= RATE_LIMIT_MS) {
         lastStatusText = newText;
         lastEditTimestamp = now;
         if (loaderMessageId) {
-          await editTelegramMessage(chatId, loaderMessageId, newText).catch(() => {});
+          await editTelegramMessage(chatId, loaderMessageId, newText);
         }
       }
     };
 
-    // 3. SSE stream parser
     const parser = createParser({
-      onEvent(event: any) {
+      onEvent: (event: EventSourceMessage) => {
         try {
           const payload = JSON.parse(event.data);
-
-          // Tool execution event (e.g. "🔍 Searching the web...")
           if (payload.type === "status" && payload.message) {
             updateStatusSafe(payload.message);
-          }
-
-          // Final completion event
-          if (payload.type === "final" && payload.response) {
+         } else if (payload.type === "approval" && payload.action) {
+  stagedApprovalHolder.data = { action: payload.action, text: payload.text || "" };
+}else if (payload.type === "final" && payload.response) {
             finalReply = payload.response;
           }
-        } catch (err) {
-          // Skip unparseable chunks
+        } catch {
+          // Ignore partial or non-JSON chunks
         }
       },
     });
 
-    // Feed incoming HTTP chunks into the SSE parser (single listener)
     streamResponse.data.on("data", (chunk: Buffer) => {
       parser.feed(chunk.toString("utf-8"));
     });
 
-    // Wait until the stream completes (single listener pair)
     await new Promise((resolve, reject) => {
       streamResponse.data.on("end", resolve);
       streamResponse.data.on("error", reject);
     });
 
-    // Stop the typing heartbeat the moment we're done waiting on the agent —
-    // not after we've also finished formatting/sending the reply. Telegram's
-    // "typing..." bubble only auto-expires up to 5s after the *last* chat
-    // action sent, and editing a message does not clear it early, so any
-    // heartbeat tick fired during the final send/edit calls below would
-    // leave the bubble visible for several seconds after the answer appears.
-    stopTyping();
-
-    if (!finalReply) {
-      finalReply = "Action completed, but no textual summary was returned.";
+    if (!finalReply || !finalReply.trim()) {
+      finalReply = "✅ Action completed.";
     }
 
-    // 4. Handle output (Base64 image, Image URL, or Text)
+    // 1. Process Dedicated Approval Events or Regex Fallback
+    const approvalMatch = finalReply.match(/\[APPROVAL_REQUIRED:([\s\S]*?)\]/);
+    const staged = stagedApprovalHolder.data;
+
+    if (staged || approvalMatch) {
+      try {
+        const actionData = staged ? staged.action : JSON.parse(approvalMatch![1]);
+        const promptTextClean = staged
+          ? staged.text || finalReply
+          : finalReply.replace(/\[APPROVAL_REQUIRED:[\s\S]*?\]/, "").trim();
+
+        const actionId = crypto.randomUUID().slice(0, 8);
+        pendingActions.set(actionId, { chatId, actionData, tokens });
+
+        if (loaderMessageId) {
+          await editTelegramMessage(chatId, loaderMessageId, "⏳ Awaiting confirmation...");
+        }
+        await sendTelegramApprovalMessage(chatId, promptTextClean, actionId);
+        return;
+      } catch (err) {
+        console.error("Failed to parse approval data:", err);
+      }
+    }
+
+    // 2. Process Visual Media
     const base64Match = finalReply.match(/\[IMAGE_BASE64:\s*([^\]]+)\]/);
     const imgMatch = finalReply.match(/\[IMAGE_URL:\s*(https?:\/\/[^\s\]]+)\]/);
 
     if (base64Match) {
       const dataUri = base64Match[1];
       const cleanReply = finalReply.replace(/\[IMAGE_BASE64:\s*[^\]]+\]/, "").trim();
-      if (loaderMessageId) await editTelegramMessage(chatId, loaderMessageId, "✅ *Generated:*");
+      if (loaderMessageId) await editTelegramMessage(chatId, loaderMessageId, "✅ Generated visual:");
       await sendTelegramBase64Photo(chatId, dataUri, cleanReply);
     } else if (imgMatch) {
       const photoUrl = imgMatch[1];
       const cleanReply = finalReply.replace(/\[IMAGE_URL:\s*https?:\/\/[^\s\]]+\]/, "").trim();
-      if (loaderMessageId) await editTelegramMessage(chatId, loaderMessageId, "📸 *Here is what I found:*");
+      if (loaderMessageId) await editTelegramMessage(chatId, loaderMessageId, "📸 Image retrieved:");
       await sendTelegramPhoto(chatId, photoUrl, cleanReply);
     } else {
-      // Deliver the final generated Markdown response
       if (loaderMessageId) {
         await editTelegramMessage(chatId, loaderMessageId, finalReply);
       } else {
         await sendTelegramMessage(chatId, finalReply);
       }
     }
-  } catch (error: any) {
-    // Stop the heartbeat immediately on error too, before spending time
-    // sending the error notice, for the same reason as above.
-    stopTyping();
-    console.error("Agent dispatch error:", error.response?.data || error.message);
-    const errorNotice = "⚠️ *Otis encountered an issue* processing your request.";
+  } catch (err: any) {
+    console.error("Agent Dispatch Error:", err.message);
+    const errMsg = "⚠️ Otis encountered an issue executing this request.";
     if (loaderMessageId) {
-      await editTelegramMessage(chatId, loaderMessageId, errorNotice);
+      await editTelegramMessage(chatId, loaderMessageId, errMsg);
     } else {
-      await sendTelegramMessage(chatId, errorNotice);
+      await sendTelegramMessage(chatId, errMsg);
     }
-  } finally {
-    // Safety net in case an early return/throw skipped both explicit calls
-    // above. clearInterval on an already-cleared interval is a harmless no-op.
-    stopTyping();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram Webhook Handler
+// ---------------------------------------------------------------------------
+
+app.post("/webhook/telegram", async (req: Request, res: Response) => {
+  res.sendStatus(200);
+
+  const body = req.body;
+
+  // 1. Interactive Button Callback Queries
+  if (body.callback_query) {
+    const cq = body.callback_query;
+    const data: string = cq.data || "";
+    const messageId = cq.message?.message_id;
+    const chatId = cq.message?.chat?.id;
+
+    const [actionType, actionId] = data.split(":");
+    const pending = pendingActions.get(actionId);
+
+    if (!pending) {
+      await answerCallbackQuery(cq.id, "This approval request has expired.");
+      return;
+    }
+
+    if (actionType === "cancel") {
+      pendingActions.delete(actionId);
+      await answerCallbackQuery(cq.id, "Action cancelled.");
+      if (messageId && chatId) {
+        await editTelegramMessage(chatId, messageId, "❌ Staged email draft was cancelled.");
+      }
+      return;
+    }
+
+    if (actionType === "confirm") {
+      await answerCallbackQuery(cq.id, "Sending email...");
+      if (messageId && chatId) {
+        await editTelegramMessage(chatId, messageId, "🚀 Sending email...");
+      }
+
+      try {
+        const response = await axios.post("http://127.0.0.1:8000/api/agent/confirm-action", {
+          chat_id: chatId,
+          google_tokens: pending.tokens,
+          action_data: pending.actionData,
+        });
+
+        pendingActions.delete(actionId);
+        if (messageId && chatId) {
+          await editTelegramMessage(chatId, messageId, response.data.result || "✅ Email dispatched.");
+        }
+      } catch (err: any) {
+        if (messageId && chatId) {
+          await editTelegramMessage(chatId, messageId, `❌ Failed to dispatch email: ${err.message}`);
+        }
+      }
+    }
+    return;
+  }
+
+  // 2. Incoming Messages
+  if (!body.message) return;
+
+  const msg = body.message;
+  const chatId = msg.chat.id;
+
+  const tokens = getStoredTokens(chatId);
+
+  if (msg.text === "/start") {
+    await sendTelegramMessage(chatId, "👋 **Otis online.** Ready to assist with your workspace, tasks, and schedule.");
+    return;
+  }
+
+  let promptText = msg.text || msg.caption || "";
+  let audioPayload: any = null;
+  let imagePayload: any = null;
+  let locationPayload: { latitude: number; longitude: number } | null = null;
+
+  // Real-Time Location Pins
+  if (msg.location) {
+    locationPayload = {
+      latitude: msg.location.latitude,
+      longitude: msg.location.longitude,
+    };
+    if (!promptText) {
+      promptText = `I have shared my current coordinates: Latitude ${msg.location.latitude}, Longitude ${msg.location.longitude}. Use these coordinates for any local queries, navigation, or weather requests.`;
+    }
+  }
+
+  // Audio / Voice Memos
+  if (msg.voice || msg.audio) {
+    const fileId = msg.voice?.file_id || msg.audio?.file_id;
+    try {
+      const fileRes = await axios.get(`${TELEGRAM_API_BASE}/getFile?file_id=${fileId}`);
+      const filePath = fileRes.data?.result?.file_path;
+      const fileDownload = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+        responseType: "arraybuffer",
+      });
+
+      audioPayload = {
+        data: Buffer.from(fileDownload.data).toString("base64"),
+        mime_type: msg.voice ? "audio/ogg" : "audio/mpeg",
+      };
+      if (!promptText) promptText = "Listen to this audio note and execute any requests.";
+    } catch (e: any) {
+      console.error("Audio download error:", e.message);
+    }
+  }
+
+  // Image Attachments
+  if (msg.photo && msg.photo.length > 0) {
+    const bestPhoto = msg.photo[msg.photo.length - 1];
+    try {
+      const fileRes = await axios.get(`${TELEGRAM_API_BASE}/getFile?file_id=${bestPhoto.file_id}`);
+      const filePath = fileRes.data?.result?.file_path;
+      const fileDownload = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+        responseType: "arraybuffer",
+      });
+
+      imagePayload = {
+        data: Buffer.from(fileDownload.data).toString("base64"),
+        mime_type: "image/jpeg",
+      };
+      if (!promptText) promptText = "Analyze this image and execute any relevant tools.";
+    } catch (e: any) {
+      console.error("Image download error:", e.message);
+    }
+  }
+
+  if (!promptText && !audioPayload && !imagePayload && !locationPayload) return;
+
+  await processUserPrompt({
+    chatId,
+    promptText,
+    tokens,
+    audioPayload,
+    imagePayload,
+    locationPayload,
+  });
 });
 
-app.listen(config.PORT, () => {
-  console.log(`Otis Gateway active on port ${config.PORT}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Otis Node.js Gateway running on port ${PORT}`);
 });
