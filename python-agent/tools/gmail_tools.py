@@ -1,8 +1,12 @@
 import base64
 import json
+import os
 import re
 from email.header import Header
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -20,10 +24,8 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
-
 def get_gmail_service(creds_data: dict):
     creds = build_google_credentials(creds_data)
-    # Ensure token is refreshed if expired
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
@@ -95,17 +97,18 @@ def search_email_threads(query: str, max_results: int = 3) -> str:
         return f"Error searching emails: {str(e)}"
 
 
+
 @tool
-def send_email(recipient: str, subject: str, body: str) -> str:
+def send_email(recipient: str, subject: str, body: str, image_base64: str = None) -> str:
     """
     Stages an email draft for user confirmation before dispatching.
     Always use this when sending an email to a recipient.
-    The recipient MUST be a full email address (use search_contact first if you only have a name).
-
+    
     Args:
         recipient: Email address of the recipient.
         subject: Subject line of the email.
         body: Plain text content or message body of the email.
+        image_base64: Optional base64-encoded image string to attach to the email (from generate_image).
     """
     recipient = (recipient or "").strip()
     if not EMAIL_RE.match(recipient):
@@ -119,19 +122,27 @@ def send_email(recipient: str, subject: str, body: str) -> str:
         "recipient": recipient,
         "subject": subject,
         "body": body,
+        "image_base64": image_base64,
     }
 
+    attachment_note = "\n📎 *Attachment:* 1 Image attached" if image_base64 else ""
+
     return (
-        f"✉️ Email staged for approval\n\n"
-        f"To: {recipient}\n"
-        f"Subject: {subject}\n\n"
-        f"Body:\n{body}\n\n"
+        f"✉️ **Email Staged for Approval**\n\n"
+        f"**To:** {recipient}\n"
+        f"**Subject:** {subject}{attachment_note}\n\n"
+        f"**Body:**\n{body}\n\n"
         f"[APPROVAL_REQUIRED:{json.dumps(payload)}]"
     )
 
 
-@tool
-def execute_send_email_direct(tokens: dict, recipient: str, subject: str, body: str) -> str:
+def execute_send_email_direct(
+    tokens: dict,
+    recipient: str,
+    subject: str,
+    body: str,
+    image_base64: str = None
+) -> str:
     """Directly sends the email via Gmail API once confirmed by the user."""
     try:
         refresh_token = tokens.get("refresh_token")
@@ -142,28 +153,41 @@ def execute_send_email_direct(tokens: dict, recipient: str, subject: str, body: 
         if not EMAIL_RE.match(recipient):
             return f"❌ Failed to dispatch email: '{recipient}' is not a valid email address."
 
-        # Build credentials with auto-refresh capability
+        client_id = tokens.get("client_id") or os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = tokens.get("client_secret") or os.getenv("GOOGLE_CLIENT_SECRET")
+        token_uri = tokens.get("token_uri") or GOOGLE_TOKEN_URI
+
         creds = Credentials(
             token=tokens.get("token") or tokens.get("access_token"),
             refresh_token=refresh_token,
-            token_uri=tokens.get("token_uri") or GOOGLE_TOKEN_URI,
-            client_id=tokens.get("client_id"),
-            client_secret=tokens.get("client_secret"),
+            token_uri=token_uri,
+            client_id=client_id,
+            client_secret=client_secret,
             scopes=GMAIL_SCOPES,
         )
 
-        # Explicitly refresh if expired or about to expire
         if (not creds.valid or creds.expired) and creds.refresh_token:
             creds.refresh(Request())
 
         service = build("gmail", "v1", credentials=creds, static_discovery=False)
 
-        # UTF-8 encoding support for emojis and special characters
-        message = MIMEText(body or "", "plain", "utf-8")
+        # Build multipart email to support text + image attachments
+        message = MIMEMultipart()
         message["To"] = recipient
         message["Subject"] = Header(subject or "", "utf-8")
-        raw_msg = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        message.attach(MIMEText(body or "", "plain", "utf-8"))
 
+        # Attach image if provided
+        if image_base64:
+            clean_b64 = re.sub(r"^data:image/\w+;base64,", "", image_base64)
+            img_data = base64.b64decode(clean_b64)
+            attachment_part = MIMEBase("application", "octet-stream")
+            attachment_part.set_payload(img_data)
+            encoders.encode_base64(attachment_part)
+            attachment_part.add_header("Content-Disposition", 'attachment; filename="attachment.png"')
+            message.attach(attachment_part)
+
+        raw_msg = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         sent = service.users().messages().send(userId="me", body={"raw": raw_msg}).execute()
         print(f"[GMAIL] Successfully sent message id={sent.get('id')} to {recipient}")
 
@@ -172,10 +196,6 @@ def execute_send_email_direct(tokens: dict, recipient: str, subject: str, body: 
     except HttpError as e:
         status = getattr(e.resp, "status", "?")
         reason = getattr(e, "reason", None) or str(e)
-        print(f"[GMAIL ERROR] HTTP {status}: {e}")
-        if status == 403:
-            reason += " (Account lacks the 'gmail.send' scope or Gmail API is not enabled in Google Console)"
         return f"❌ Failed to dispatch email: HTTP {status}: {reason}"
     except Exception as e:
-        print(f"[GMAIL ERROR] {type(e).__name__}: {e}")
         return f"❌ Failed to dispatch email: {str(e)}"

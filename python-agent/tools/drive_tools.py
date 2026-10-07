@@ -84,3 +84,37 @@ def search_drive_files(query: str, max_results: int = 5) -> str:
   except Exception as e:
     print(f"--> [DRIVE ERROR] {str(e)}")
     return f"Drive search error: {str(e)}"
+
+
+import io
+from langchain_core.tools import tool
+from googleapiclient.http import MediaIoBaseDownload
+
+@tool
+def read_drive_file(file_id: str) -> str:
+    """Read the text content of a Google Drive file (Doc, PDF, DOCX, TXT). Use the file_id from search_drive_files."""
+    service = get_drive_service()  # build from get_current_google_tokens()
+    meta = service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    mime = meta["mimeType"]
+
+    if mime == "application/vnd.google-apps.document":
+        data = service.files().export(fileId=file_id, mimeType="text/plain").execute()
+        text = data.decode("utf-8", errors="ignore")
+    else:
+        buf = io.BytesIO()
+        req = service.files().get_media(fileId=file_id)
+        dl = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        buf.seek(0)
+        if mime == "application/pdf":
+            from pypdf import PdfReader  # pip install pypdf
+            text = "\n".join(p.extract_text() or "" for p in PdfReader(buf).pages)
+        elif mime.endswith("wordprocessingml.document"):
+            import docx  # pip install python-docx
+            text = "\n".join(p.text for p in docx.Document(buf).paragraphs)
+        else:
+            text = buf.read().decode("utf-8", errors="ignore")
+
+    return f"File: {meta['name']}\n\n{text[:8000]}"  # cap size to protect your token budget  

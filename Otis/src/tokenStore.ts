@@ -14,7 +14,7 @@ interface StoredTokens {
   expiry_date?: number | null;
 }
 
-function encrypt(text: string): string {
+export function encrypt(text: string): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(
     ALGORITHM,
@@ -29,7 +29,7 @@ function encrypt(text: string): string {
   return `${iv.toString("hex")}:${authTag}:${encrypted}`;
 }
 
-function decrypt(encryptedText: string): string {
+export function decrypt(encryptedText: string): string {
   const [ivHex, authTagHex, encryptedData] = encryptedText.split(":");
   const decipher = crypto.createDecipheriv(
     ALGORITHM,

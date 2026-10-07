@@ -1,10 +1,13 @@
 import os
 import json
 import asyncio
+import hashlib
 import tracemalloc
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, Any
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 tracemalloc.start()
 
@@ -32,8 +35,42 @@ from tools.gmail_tools import execute_send_email_direct
 
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-def build_google_tokens(raw: dict) -> dict:
-    tokens = dict(raw or {})
+def parse_and_decrypt_tokens(raw: Any) -> dict:
+    """Parses token dicts, JSON strings, or decrypts AES-256-GCM ciphertexts if needed."""
+    if isinstance(raw, dict):
+        return raw
+
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        # Direct JSON string
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            try:
+                return json.loads(cleaned)
+            except Exception:
+                pass
+
+        # Encrypted ciphertext format (iv:tag:data)
+        if ":" in cleaned:
+            parts = cleaned.split(":")
+            if len(parts) == 3:
+                try:
+                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                    raw_key = os.getenv("ENCRYPTION_KEY") or os.getenv("TOKEN_SECRET") or os.getenv("JWT_SECRET") or ""
+                    if raw_key:
+                        key = bytes.fromhex(raw_key) if len(raw_key) == 64 else hashlib.sha256(raw_key.encode()).digest()
+                        iv = bytes.fromhex(parts[0])
+                        tag = bytes.fromhex(parts[1])
+                        encrypted = bytes.fromhex(parts[2])
+                        aesgcm = AESGCM(key)
+                        decrypted = aesgcm.decrypt(iv, encrypted + tag, None)
+                        return json.loads(decrypted.decode("utf-8"))
+                except Exception as err:
+                    print(f"[AUTH PYTHON DECRYPT ERROR]: {err}")
+
+    return {}
+
+def build_google_tokens(raw: Any) -> dict:
+    tokens = parse_and_decrypt_tokens(raw)
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         return tokens
@@ -45,6 +82,7 @@ def build_google_tokens(raw: dict) -> dict:
     if not client_id or not client_secret:
         return tokens
 
+    # Set token=None to force credentials to refresh and obtain a fresh access token
     creds = Credentials(
         token=tokens.get("access_token"),
         refresh_token=refresh_token,
@@ -54,11 +92,12 @@ def build_google_tokens(raw: dict) -> dict:
     )
 
     try:
-        if not creds.valid or creds.expired:
-            creds.refresh(GoogleAuthRequest())
+        creds.refresh(GoogleAuthRequest())
     except RefreshError as e:
         print(f"[AUTH WARNING] Refresh token rejected: {e}")
         return tokens
+    except Exception as e:
+        print(f"[AUTH REFRESH ERROR] {e}")
 
     tokens.update({
         "token": creds.token,
@@ -70,12 +109,12 @@ def build_google_tokens(raw: dict) -> dict:
     })
     return tokens
 
-async def resolve_google_tokens(raw: dict) -> dict:
+async def resolve_google_tokens(raw: Any) -> dict:
     try:
         return await asyncio.to_thread(build_google_tokens, raw)
     except Exception as e:
-        print(f"[AUTH REFRESH ERROR] {e}")
-        return raw or {}
+        print(f"[AUTH ERROR] {e}")
+        return parse_and_decrypt_tokens(raw)
 
 def extract_approval(tool_output) -> Optional[dict]:
     content = getattr(tool_output, "content", tool_output)
@@ -124,7 +163,7 @@ class LocationPayload(BaseModel):
 class AgentPayload(BaseModel):
     prompt: Optional[str] = ""
     chat_id: Union[str, int]
-    google_tokens: dict = {}
+    google_tokens: Any = {}
     audio: Optional[MediaPayload] = None
     image: Optional[MediaPayload] = None
     location: Optional[LocationPayload] = None
@@ -136,7 +175,7 @@ class AgentPayload(BaseModel):
 
 class ConfirmActionPayload(BaseModel):
     chat_id: Union[str, int]
-    google_tokens: dict
+    google_tokens: Any = {}
     action_data: dict
 
 @app.get("/health")
@@ -155,14 +194,16 @@ async def confirm_action(payload: ConfirmActionPayload):
             recipient=payload.action_data.get("recipient", ""),
             subject=payload.action_data.get("subject", ""),
             body=payload.action_data.get("body", ""),
+            image_base64=payload.action_data.get("image_base64"),
         )
         return {"result": result}
 
     return JSONResponse(status_code=400, content={"error": f"Unknown action: {action}"})
 
-STATE_LOOKUP_TIMEOUT = 15
-STALL_TIMEOUT = 30
-HARD_TIMEOUT = 180
+
+STATE_LOOKUP_TIMEOUT = 30  
+STALL_TIMEOUT = 90          
+HARD_TIMEOUT = 300          
 
 @app.post("/api/agent/dispatch-stream")
 async def dispatch_prompt_stream(payload: AgentPayload):
@@ -172,51 +213,60 @@ async def dispatch_prompt_stream(payload: AgentPayload):
     tokens = await resolve_google_tokens(payload.google_tokens)
     set_execution_context(tokens, payload.chat_id)
 
-    current_time_str = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
+    
 
-    system_instruction = f"""You are Otis, an elite, highly direct autonomous executive assistant.
-Current Date and Time: {current_time_str} (IST / Asia/Kolkata, UTC+05:30).
-User Timezone: Asia/Kolkata (+05:30).
 
-TOOLING & CAPABILITY MATRIX:
-• Google Workspace: Gmail (search_email_threads, fetch_unread_emails, send_email), Calendar (list_upcoming_events, create_calendar_event, update_calendar_event, delete_calendar_event), Contacts (search_contact), Tasks (list_tasks, create_task, complete_task, delete_task).
-• Drive & Sheets: Drive (search_drive_files), Sheets (read_sheet_data, append_row_to_sheet, create_spreadsheet, clear_sheet_range, delete_sheet_row).
-• Intelligence & Media: web_search, browse_url, search_image, generate_image, get_youtube_transcript, extract_video_id.
-• Navigation & Environment: get_current_weather, get_commute_and_distance.
+    # Refresh this on every request or scheduled run so the time stays current
+    current_time_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%A, %d %B %Y, %I:%M %p")
 
-NON-NEGOTIABLE OPERATIONAL RULES:
-1. NO GUESSING OR HALLUCINATED ACTIONS:
-- NEVER guess document IDs, event IDs, task IDs, or contact email addresses.
-- To cancel/update a meeting: Call `list_upcoming_events` first to get the verified `event_id`, then invoke `update_calendar_event` or `delete_calendar_event`.
-- To complete/delete a task: Call `list_tasks` first to get the `task_id`, then proceed.
-- To email someone by name: Call `search_contact` first to locate their exact email address before staging.
+    system_instruction = f"""You are Otis, a direct, autonomous executive assistant on Telegram.
+    Now: {current_time_str} (Asia/Kolkata, UTC+05:30). All times are IST.
 
-2. DRIVE & WORKSPACE SEARCH INTEGRITY:
-- If the user mentions any file, document, PDF, invoice, resume, or sheet, YOU MUST immediately call `search_drive_files`. Never answer "I do not see the file" without searching Drive first.
+    TOOLS
+    Gmail: search_email_threads, fetch_unread_emails, send_email
+    Calendar: list_upcoming_events, create_calendar_event, update_calendar_event, delete_calendar_event
+    Contacts: search_contact | Tasks: list_tasks, create_task, complete_task, delete_task
+    Drive/Sheets: search_drive_files, read_sheet_data, append_row_to_sheet, create_spreadsheet, clear_sheet_range, delete_sheet_row
+    Web/Media: web_search, browse_url, search_image, generate_image, get_youtube_transcript, extract_video_id
+    Environment: get_current_weather, get_commute_and_distance
 
-3. EMAIL DISPATCH SAFETY (HUMAN-IN-THE-LOOP):
-- Always invoke `send_email` with the explicit recipient, subject, and drafted body.
-- `send_email` automatically stages the draft for approval. Never claim an email was dispatched until confirmed.
+    SPEED RULES
+    - Call independent tools in parallel in a single step (e.g. Calendar + Gmail + Tasks together). Never call them one by one.
+    - Don't repeat a lookup if the needed ID or email is already in this conversation.
+    - Fetch only what's needed: small limits (5-10 items), no full-thread or full-page reads unless asked.
+    - Don't ask permission for read-only actions. Act, then report.
 
-4. STRICT ISO-8601 TIMESTAMPS:
-- For calendar tools (`create_calendar_event`, `update_calendar_event`), start and end times must strictly follow ISO-8601 with offset: `YYYY-MM-DDTHH:MM:SS+05:30`.
-- Assume meetings are 30 minutes long unless specified otherwise.
+    ACCURACY RULES
+    - Never guess IDs or email addresses. Look them up first:
+    • Update/cancel event: list_upcoming_events, then update/delete.
+    • Complete/delete task: list_tasks, then act.
+    • Email by name: search_contact, then send_email.
+    - Any mention of a file, doc, PDF, invoice, resume or sheet: call search_drive_files before replying. Never say "I can't find it" without searching Drive first.
+    - If multiple matches exist for a contact, event or task, ask the user to pick one. Don't guess.
 
-5. ALWAYS PRODUCE A TEXT RESPONSE:
-- After a tool executes, you MUST synthesize a clear, informative message to the user summarizing the result.
+    AUTOMATED BRIEFS
+    For "Morning Executive Briefing" or system scans:
+    1. No greeting at the start and no questions. Immediately fetch Calendar (today), Gmail (unread) and Tasks (pending) in parallel.
+    2. Output the report with these sections: *📅 Schedule* • *📧 Priority Emails* • *✅ Tasks Due* • *⚠️ Needs Attention*
+    3. End the report with exactly this line: "Hope you have a good day! 😊"
+    4. Never ask "How can I assist you?" or any other question.
 
-6. MEDIA FORMATTING DIRECTIVES:
-- If you call `search_image` to find a picture, output the image tag on its own line: [IMAGE_URL: <url>].
-- If you call `generate_image`, output the base64 result on its own line: [IMAGE_BASE64: <data>].
+    ACTION RULES
+    - send_email: always include explicit recipient, subject and body. If the user wants edits, revise and re-invoke send_email.
+    - Image in email: call generate_image or search_image first, then pass the base64 string to send_email(image_base64=...).
+    - Calendar times: ISO-8601 with offset, YYYY-MM-DDTHH:MM:SS+05:30. Default duration is 30 minutes. Resolve "tomorrow", "Friday" etc. relative to the current date above.
+    
+    - Any mention of a file, doc, PDF, invoice, resume or sheet: call search_drive_files, then read_drive_file with the file_id to get the content. Never use browse_url on Drive links. 
 
-7. OUTPUT STYLE & PERSONALITY:
-- Be concise, sharp, and executive. Zero conversational fluff.
-- Use standard, clean Telegram Markdown (bold `**text**`, bullet points `•`).
-"""
-
+    OUTPUT
+    - After any tool call, always send a short text summary of the result.
+    - Concise, executive tone. No filler.
+    - search_image result: put [IMAGE_URL: <url>] on its own line.
+    - generate_image result: keep [IMAGE_PATH: <path>] exactly as returned, on its own line. Never convert it to IMAGE_URL.
+    - Format: Telegram Markdown with *bold* (single asterisks) and • bullets.
+    """
     config = {"configurable": {"thread_id": str(payload.chat_id)}}
 
-    # Inject location context if sent
     loc_context = ""
     if payload.location:
         loc_context = f"\n[User Shared Real-time Coordinates: Latitude {payload.location.latitude}, Longitude {payload.location.longitude}]"
@@ -312,7 +362,7 @@ NON-NEGOTIABLE OPERATIONAL RULES:
 
                 if kind == "on_tool_start":
                     tool_name = event.get("name", "")
-                    status = TOOL_STATUS_MESSAGES.get(tool_name, f"⚙️️ Running {tool_name}...")
+                    status = TOOL_STATUS_MESSAGES.get(tool_name, f"⚙ Running {tool_name}...")
                     yield f"data: {json.dumps({'type': 'status', 'message': status})}\n\n"
 
                 elif kind == "on_tool_end" and event.get("name") == "send_email":
