@@ -1359,6 +1359,10 @@ res.send({
 })
 
 
+app.get("/googlea080b99fe92b7b48.html", (req, res) => {
+  res.type("html").send("google-site-verification: googlea080b99fe92b7b48.html");
+});
+
 
 
 
