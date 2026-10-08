@@ -3,13 +3,16 @@
 // Import these in your server and send them with app.get (see routes example).
 
 export const CONFIG = {
-  appName: "Otis",
+  appName: "Otis Assistant", // must match the app name on your Google OAuth consent screen exactly
   botUsername: "OtisExecutiveBot",
   ownerName: "Atul Khiyani",
   contactEmail: "atulkhiyani09@gmail.com",
   domain: "https://otis-1-keq6.onrender.com",
   lastUpdated: "October 9, 2026",
   country: "India",
+  // Paste the token from Google Search Console (HTML tag method) into the
+  // GOOGLE_SITE_VERIFICATION env var, or here.
+  googleSiteVerification: process.env.GOOGLE_SITE_VERIFICATION || "",
   // List the Google data your app really accesses. Google compares this
   // against the OAuth scopes you request, so keep them in sync.
   googleData: [
@@ -180,6 +183,7 @@ export function layout(title: string, description: string, body: string): string
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${title}</title>
   <meta name="description" content="${description}">
+  ${CONFIG.googleSiteVerification ? `<meta name="google-site-verification" content="${CONFIG.googleSiteVerification}">` : ""}
   <style>${css}</style>
 </head>
 <body>
