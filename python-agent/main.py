@@ -10,6 +10,7 @@ from typing import Optional, Union, Any, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from tools.attachment_context import set_current_attachments
+import base64
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,6 +24,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.auth.exceptions import RefreshError
+from tools.image_store import begin_request, get_image
 
 import agent
 from agent import (
@@ -36,10 +38,11 @@ from tools.gmail_tools import execute_send_email_direct
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
 
+
 # The system prompt is only injected when a conversation thread is brand new.
 # Bumping this value starts fresh threads (also clears any thread poisoned by a
 # failed media message). Old history stays in SQLite but is no longer used.
-THREAD_VERSION = os.getenv("THREAD_VERSION", "v6")
+THREAD_VERSION = os.getenv("THREAD_VERSION", "v7")
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +488,7 @@ def build_system_instruction() -> str:
     - [AUTOMATED:scheduled_task]: a task the user scheduled earlier. Do the instruction after the tag now. No greeting, concise result.
 
     ACTION RULES
+     a generated image: call generate_image, then pass the internal id from its result: send_email(image_paths="gen:<id>").
     - send_email: always include explicit recipient, subject and body. If the user wants edits, revise and re-invoke send_email.
     - Attachments in email: (a) a photo or file the user just sent in chat: send_email(attach_chat_files=true). (b) a Drive file: do NOT read it, just pass its name or id: send_email(drive_files="Invoice.pdf"); separate several with " | ". If it reports several matches, ask the user which one (poll), then retry with the id. (c) a generated image: call generate_image, take the path from [IMAGE_PATH: ...] and call send_email(image_paths="<path>"). (d) revising a draft: pass the attachment_refs from the earlier draft so the files are kept. Web images from search_image can't be attached: offer to send the link instead.
     - Calendar times: ISO-8601 with offset, YYYY-MM-DDTHH:MM:SS+05:30. Default duration is 30 minutes. Resolve "tomorrow", "Friday" etc. relative to the current date above.
@@ -509,7 +513,7 @@ def build_system_instruction() -> str:
     - After any tool call, always send a short text summary of the result (the only exception is a heartbeat with nothing new: reply exactly [NO_ALERT]).
     - Concise, executive tone. No filler.
     - search_image result: put [IMAGE_URL: <url>] on its own line.
-    - generate_image result: keep [IMAGE_PATH: <path>] exactly as returned, on its own line. Never convert it to IMAGE_URL.
+    - generate_image: the image is attached to your reply automatically. Never write an image tag, path, link or id. Just add a one-line caption.
     - Format: Telegram Markdown with *bold* (single asterisks) and • bullets.
 
     """
@@ -660,6 +664,7 @@ async def dispatch_prompt_stream(payload: AgentPayload):
                 await queue.put(("done", None))
 
         set_current_attachments(chat_files)
+        image_outbox = begin_request()
         producer_task = asyncio.create_task(producer())
         start = asyncio.get_event_loop().time()
 
@@ -767,6 +772,12 @@ async def dispatch_prompt_stream(payload: AgentPayload):
                 final_text = "[NO_ALERT]"
 
             final_text = final_text or "✅ Done."
+
+            if image_outbox:
+                found = get_image(image_outbox[-1])   # latest image generated in this request
+                if found:
+                    img_bytes, img_mime = found
+                    final_text += f"\n[IMAGE_BASE64: data:{img_mime};base64,{base64.b64encode(img_bytes).decode()}]"
 
             if approval_holder["data"]:
                 yield f"data: {json.dumps({'type': 'approval', **approval_holder['data']})}\n\n"

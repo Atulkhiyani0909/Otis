@@ -9,3 +9,5 @@ google-auth
 pydantic
 python-dotenv
 requests
+langgraph-checkpoint-sqlite
+aiosqlite

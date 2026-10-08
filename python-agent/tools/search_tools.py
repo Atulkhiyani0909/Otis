@@ -122,10 +122,61 @@ def search_image(query: str) -> str:
         return f"Image search failed: {str(e)}"
 
 
+import base64
+import json
+import os
+import urllib.error
+import urllib.request
+
+from langchain_core.tools import tool
+
+from tools.image_store import put_image, queue_for_delivery
+
+
+
+
+def _sniff_mime(data: bytes, fallback: str = None) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return fallback or "image/png"
+
+
+def _find_image(resp: dict):
+    """Returns (image_bytes, mime, text_parts). Skips the model's interim 'thought' images."""
+    texts = []
+
+    top = resp.get("output_image")
+    if isinstance(top, dict) and top.get("data"):
+        try:
+            return base64.b64decode(top["data"]), top.get("mime_type"), texts
+        except Exception:
+            pass
+
+    for step in resp.get("steps") or []:
+        if not isinstance(step, dict) or step.get("type") == "thought":
+            continue
+        for block in step.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image" and block.get("data"):
+                try:
+                    return base64.b64decode(block["data"]), block.get("mime_type"), texts
+                except Exception:
+                    continue
+            if block.get("type") == "text" and block.get("text"):
+                texts.append(block["text"])
+    return None, None, texts
+
 @tool
 def generate_image(prompt: str) -> str:
-    """Generates a high-quality visual or graphic from a text description.
-    Use this when the user asks to create, draw, generate, or make an image of something.
+    """Generates a high-quality image from a text description and sends it to the user automatically.
+    Use this when the user asks to create, draw, generate, design or make an image of something.
+    Write the prompt as a rich description: subject, style (photo, 3D, watercolor, flat icon...),
+    lighting, composition, colors, and any exact text that must appear in the image.
     Args:
         prompt: Detailed description of the image to generate.
     """
@@ -133,30 +184,42 @@ def generate_image(prompt: str) -> str:
     if not prompt:
         return "Error: Prompt cannot be empty."
 
+    base = os.getenv("POLLINATIONS_URL", "https://image.pollinations.ai/prompt").rstrip("/")
+    width = os.getenv("POLLINATIONS_WIDTH", "1024").strip() or "1024"
+    height = os.getenv("POLLINATIONS_HEIGHT", "1024").strip() or "1024"
+    model = os.getenv("POLLINATIONS_MODEL", "flux").strip() or "flux"
+
+    params = {
+        "width": width,
+        "height": height,
+        "model": model,
+        "nologo": "true",
+        "seed": random.randint(1, 10_000_000),
+    }
+    url = f"{base}/{urllib.parse.quote(prompt[:1500], safe='')}?{urllib.parse.urlencode(params)}"
+
+    req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
+
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        seed = random.randint(1000, 99999)
-        
-        # enhance=false removes the 8s LLM delay; 768x768 turbo renders in ~2 seconds
-        engine_url = (
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            f"?width=768&height=768&nologo=true&model=turbo&enhance=false&seed={seed}"
-        )
-
-        req = urllib.request.Request(engine_url, headers=DEFAULT_HEADERS)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            image_data = resp.read()
-
-        if not image_data or len(image_data) < 1000:
-            return "Failed to generate image: empty stream received."
-
-        filename = f"gen_{uuid.uuid4().hex[:8]}.jpg"
-        file_path = os.path.join(MEDIA_DIR, filename)
-        with open(file_path, "wb") as f:
-            f.write(image_data)
-
-        # Output the exact tag with the local path
-        return f"[IMAGE_PATH: {file_path}]\nVisual generated successfully."
-
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            image_bytes = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return "Failed to generate image: Pollinations rate limit reached. Try again in a minute."
+        return f"Failed to generate image: HTTP {e.code}."
     except Exception as e:
         return f"Failed to generate image: {str(e)}"
+
+    if not content_type.startswith("image/") or len(image_bytes) < 1000:
+        return "Failed to generate image: the service did not return a valid image. Suggest rephrasing or trying again."
+
+    mime = _sniff_mime(image_bytes, content_type.split(";")[0].strip() or None)
+    ref = put_image(image_bytes, mime)   # kept in memory only
+    queue_for_delivery(ref)              # main.py sends it with your reply
+
+    return (
+        "Image generated. It is attached to your reply to the user automatically. "
+        "Do NOT write any image tag, link, path or id in your reply: just add a short caption. "
+        f"(Internal id for emailing it: gen:{ref})"
+    )

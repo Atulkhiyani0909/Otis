@@ -153,9 +153,9 @@ def _discard(ref: str) -> None:
 def _get_chat_attachments() -> list:
     """Files/photos the user sent in the current Telegram message.
     Each item: {"data": <base64>, "mime_type": str, "filename": str | None}
-    Requires get_current_attachments() in agent.py (see setup notes)."""
+    Set per request by main.py through tools/attachment_context.py."""
     try:
-        from agent import get_current_attachments
+        from tools.attachment_context import get_current_attachments
         return get_current_attachments() or []
     except Exception:
         return []
@@ -360,8 +360,8 @@ def send_email(
         drive_files: Google Drive files to attach. Use file names or file IDs, separated by " | ".
             Google Docs/Slides are attached as PDF, Sheets as XLSX.
             If several files match a name, this tool lists them: ask the user which one, then retry with the ID.
-        image_paths: Local image file paths returned by generate_image, separated by " | ".
-            Use this to attach a generated image.
+        image_paths: Generated image ids from generate_image (looks like "gen:ab12cd34ef"),
+            separated by " | ". Use this to attach a generated image.
         attach_chat_files: Set True to attach the photo(s) or file(s) the user sent in THIS chat message.
         attachment_refs: Refs of attachments from an earlier staged draft (comma separated).
             Use when the user asks to revise a draft, so the files are kept.
@@ -414,6 +414,14 @@ def send_email(
 
         # 3. Generated images (local paths)
         for p in _split(image_paths):
+            if p.lower().startswith("gen:"):  # generated image kept in memory
+                from tools.image_store import get_image
+                found = get_image(p)
+                if not found:
+                    return fail("Error: that generated image has expired. Generate it again, then retry.")
+                img, mime = found
+                add(img, "generated_image" + (mimetypes.guess_extension(mime) or ".png"), mime)
+                continue
             result, err = _read_local_image(p)
             if err:
                 return fail(f"Error: {err}")
