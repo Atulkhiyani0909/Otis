@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "set-webhook": "tsx src/setWebhook.ts",
-    "build": "tsc",
-    "start": "node dist/server.js"
+    
+  "build": "tsc",
+  "start": "node dist/server.js"
   },
   "keywords": [],
   "author": "",

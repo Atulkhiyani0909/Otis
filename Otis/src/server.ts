@@ -4,8 +4,8 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import FormData from "form-data";
 import { createParser, type EventSourceMessage } from "eventsource-parser";
-import { saveUserTokens, getUserTokens } from "./tokenStore";
-import { getAuthUrl, oauth2Client } from "./googleAuth";
+import { saveUserTokens, getUserTokens } from "./tokenStore.js";
+import { getAuthUrl, oauth2Client } from "./googleAuth.js";
 import fs from "fs";
 import path from "path";
 import cron from "node-cron";
@@ -1831,7 +1831,7 @@ if (!promptText && !audioPayload && !imagePayload && !documentPayload && !locati
 
 
  await processUserPrompt({ chatId, promptText, tokens, audioPayload, imagePayload, documentPayload, locationPayload });
- 
+
 });
 
 // ---------------------------------------------------------------------------
