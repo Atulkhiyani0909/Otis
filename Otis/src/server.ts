@@ -9,6 +9,8 @@ import { getAuthUrl, oauth2Client } from "./googleAuth.js";
 import fs from "fs";
 import path from "path";
 import cron from "node-cron";
+import { success_response } from "./Reponse/website-reponse.js";
+import { layout , homeBody, privacyBody, termsBody } from "./pages.js";
 
 dotenv.config();
 
@@ -1346,12 +1348,33 @@ scheduleProactive(WRAPUP_CRON, "wrapup");
 // OAuth Callback Route
 // ---------------------------------------------------------------------------
 
+
+
+
 app.get("/health",(req:Request,res:Response)=>{
 res.send({
   "ready":"Main Server is Up to Date",
   "success":"True"
 })
 })
+
+
+
+
+
+app.get("/", (req, res) => {
+  res.send(layout("Otis - Personal assistant on Telegram", "Otis is a personal executive assistant on Telegram.", homeBody()));
+});
+
+app.get("/privacy-policy", (req, res) => {
+  res.send(layout("Privacy Policy - Otis", "How Otis collects, uses and protects your data.", privacyBody()));
+});
+
+app.get("/terms", (req, res) => {
+  res.send(layout("Terms of Service - Otis", "The terms that apply when you use Otis.", termsBody()));
+});
+
+app.listen(PORT);
 
 app.get("/auth/google/callback", async (req: Request, res: Response) => {
   const code = req.query.code as string;
@@ -1377,12 +1400,7 @@ if (!code || !chatId) {
       buildMainMenu()
     );
 
-    return res.send(`
-      <div style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
-        <h2>Authentication Successful!</h2>
-        <p>Your Google account has been connected to Otis. You may close this window and return to Telegram.</p>
-      </div>
-    `);
+    return res.send(success_response);
   } catch (err: any) {
     console.error("[AUTH CALLBACK ERROR]:", err.response?.data || err.message);
     return res.status(500).send("<h3>Authentication failed. Please verify console logs and try again.</h3>");

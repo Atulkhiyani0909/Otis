@@ -5,6 +5,7 @@
     "message": "Go to gym",
     "runAgent": false,
     "createdAt": 1791455128956,
-    "runAt": 1791462600000
+    "runAt": 1791462600000,
+    "firedAt": 1791489741806
   }
 ]
