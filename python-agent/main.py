@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Union, Any, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from tools.attachment_context import set_current_attachments
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -38,7 +39,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
 # The system prompt is only injected when a conversation thread is brand new.
 # Bumping this value starts fresh threads (also clears any thread poisoned by a
 # failed media message). Old history stays in SQLite but is no longer used.
-THREAD_VERSION = os.getenv("THREAD_VERSION", "v5")
+THREAD_VERSION = os.getenv("THREAD_VERSION", "v6")
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +311,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 class MediaPayload(BaseModel):
     data: str
     mime_type: str
+    filename: Optional[str] = None
 
 
 class LocationPayload(BaseModel):
@@ -324,6 +326,7 @@ class AgentPayload(BaseModel):
     audio: Optional[MediaPayload] = None
     image: Optional[MediaPayload] = None
     location: Optional[LocationPayload] = None
+    document: Optional[MediaPayload] = None  
 
     @field_validator("chat_id")
     @classmethod
@@ -355,6 +358,7 @@ async def confirm_action(payload: ConfirmActionPayload):
             subject=payload.action_data.get("subject", ""),
             body=payload.action_data.get("body", ""),
             image_base64=payload.action_data.get("image_base64"),
+            attachment_refs=payload.action_data.get("attachment_refs")
         )
         return {"result": result}
 
@@ -374,6 +378,7 @@ def build_system_instruction() -> str:
     Now: {current_time_str} ({TIMEZONE}, UTC+05:30). All times are IST.
 
     TOOLS
+    Email attachments: send_email(drive_files, image_paths, attach_chat_files)
     Gmail: search_email_threads, fetch_unread_emails, send_email
     Calendar: list_upcoming_events, create_calendar_event, update_calendar_event, delete_calendar_event
     Contacts: search_contact | Tasks: list_tasks, create_task, complete_task, delete_task
@@ -395,6 +400,8 @@ def build_system_instruction() -> str:
     • Email by name: search_contact, then send_email.
     - Any mention of a file, doc, PDF, invoice, resume or sheet: call search_drive_files, then read_drive_file with the file_id to get the content. Never say "I can't find it" without searching Drive first. Never use browse_url on Drive links.
     - If multiple matches exist for a contact, event or task, ask the user to pick one (use a poll, see POLLS). Don't guess.
+
+    Exception: when the user wants a Drive file attached to an email, skip reading and use send_email(drive_files=...).
 
     MEDIA RULES
     - If the user sends a voice note: understand it, treat it as their request and act on it. Start your reply with a short "🎙️ You said: ..." line (one sentence) so they can see you heard correctly.
@@ -479,11 +486,12 @@ def build_system_instruction() -> str:
 
     ACTION RULES
     - send_email: always include explicit recipient, subject and body. If the user wants edits, revise and re-invoke send_email.
-    - Image in email: call generate_image or search_image first, then pass the base64 string to send_email(image_base64=...).
+    - Attachments in email: (a) a photo or file the user just sent in chat: send_email(attach_chat_files=true). (b) a Drive file: do NOT read it, just pass its name or id: send_email(drive_files="Invoice.pdf"); separate several with " | ". If it reports several matches, ask the user which one (poll), then retry with the id. (c) a generated image: call generate_image, take the path from [IMAGE_PATH: ...] and call send_email(image_paths="<path>"). (d) revising a draft: pass the attachment_refs from the earlier draft so the files are kept. Web images from search_image can't be attached: offer to send the link instead.
     - Calendar times: ISO-8601 with offset, YYYY-MM-DDTHH:MM:SS+05:30. Default duration is 30 minutes. Resolve "tomorrow", "Friday" etc. relative to the current date above.
     EMAIL RULES
     - Use clean, natural paragraph breaks. NEVER output literal "\\n", "\\\\n", "/n", or escaped slash characters in the text or tool arguments.
     - The email body must contain ONLY the message itself: greeting, concise paragraphs, and sign-off.
+    If the user sends a photo or file and wants it emailed, call send_email with attach_chat_files=true. For generated images use image_paths. For Drive files use drive_files.
     - NEVER put subject lines, placeholders, markdown code fences, or conversational preambles (e.g. "Here is the draft:", "Sure, I wrote this:") inside the email body or inside `send_email` parameters.
     - When previewing an email in Telegram before sending, format it strictly as:
       *To:* recipient@example.com
@@ -525,7 +533,18 @@ def build_user_message(payload: AgentPayload, msg_id: str) -> Tuple[HumanMessage
             f"\n[User Shared Real-time Coordinates: "
             f"Latitude {payload.location.latitude}, Longitude {payload.location.longitude}]"
         )
-    prompt_content = ((payload.prompt or "") + loc_context).strip()
+
+    file_note = ""
+    if payload.document and payload.document.data:
+        kb = int(len(payload.document.data) * 3 / 4 / 1024)
+        file_note = (
+            f"\n[User attached a file: \"{payload.document.filename or 'document'}\" "
+            f"({payload.document.mime_type}, ~{kb} KB). To email it, call send_email with attach_chat_files=true.]"
+        )
+    elif payload.image and payload.image.data:
+        file_note = "\n[To email this photo, call send_email with attach_chat_files=true.]"
+
+    prompt_content = ((payload.prompt or "") + loc_context + file_note).strip()
 
     if payload.image and payload.image.data:
         text = prompt_content or "Analyze this image and execute any relevant tools."
@@ -582,7 +601,11 @@ async def dispatch_prompt_stream(payload: AgentPayload):
 
     msg_id = str(uuid.uuid4())
     new_user_message, media_kind, plain_text = build_user_message(payload, msg_id)
-
+    chat_files = [
+        {"data": m.data, "mime_type": m.mime_type, "filename": m.filename}
+        for m in (payload.image, payload.document)
+        if m and m.data
+    ]
     try:
         state = await asyncio.wait_for(
             agent.otis_graph.aget_state(config), timeout=STATE_LOOKUP_TIMEOUT
@@ -636,6 +659,7 @@ async def dispatch_prompt_stream(payload: AgentPayload):
             finally:
                 await queue.put(("done", None))
 
+        set_current_attachments(chat_files)
         producer_task = asyncio.create_task(producer())
         start = asyncio.get_event_loop().time()
 

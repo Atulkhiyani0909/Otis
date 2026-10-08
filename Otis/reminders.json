@@ -1,11 +1,10 @@
 [
   {
-    "id": "448ceb70",
+    "id": "04a58f88",
     "chatId": 8885273797,
-    "message": "Time to sleep!",
+    "message": "Go to gym",
     "runAgent": false,
-    "createdAt": 1791409025584,
-    "runAt": 1791409080000,
-    "firedAt": 1791409083663
+    "createdAt": 1791455128956,
+    "runAt": 1791462600000
   }
 ]

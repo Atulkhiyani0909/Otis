@@ -7,7 +7,7 @@ const envSchema = z.object({
   PORT: z.string().default("3000").transform((val) => parseInt(val, 10)),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
-  TELEGRAM_ALLOWED_USER_ID: z.string().min(1, "TELEGRAM_ALLOWED_USER_ID is required"),
+  // TELEGRAM_ALLOWED_USER_ID: z.string().min(1, "TELEGRAM_ALLOWED_USER_ID is required"),
   TELEGRAM_WEBHOOK_SECRET: z.string().min(16, "TELEGRAM_WEBHOOK_SECRET must be at least 16 chars"),
   SERVER_PUBLIC_URL: z.string().url("SERVER_PUBLIC_URL must be a valid URL"),
   GOOGLE_CLIENT_ID: z.string().min(1, "GOOGLE_CLIENT_ID is required"),

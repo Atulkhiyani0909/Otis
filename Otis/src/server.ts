@@ -51,10 +51,41 @@ const NO_ALERT_TOKEN = "[NO_ALERT]";
 // Staged actions storage
 const pendingActions = new Map<string, { chatId: string | number; actionData: any; tokens: any }>();
 
+
+const MAX_USERS = Number(process.env.MAX_USERS || 0); // 0 = unlimited
+const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 20);
+const hitLog = new Map<string, number[]>();
+
+function isRateLimited(chatId: string | number): boolean {
+  const key = String(chatId);
+  const now = Date.now();
+  const recent = (hitLog.get(key) || []).filter((t) => now - t < 60_000);
+  recent.push(now);
+  hitLog.set(key, recent);
+  return recent.length > RATE_LIMIT_PER_MIN;
+}
+
 // ---------------------------------------------------------------------------
 // Per-chat queue: one agent run at a time per chat
 // (stops a scheduled check-in, a button tap and a poll vote from colliding)
 // ---------------------------------------------------------------------------
+
+const OAUTH_STATE_SECRET = process.env.OAUTH_STATE_SECRET || TELEGRAM_BOT_TOKEN;
+
+function signState(chatId: string | number): string {
+  const id = String(chatId);
+  const sig = crypto.createHmac("sha256", OAUTH_STATE_SECRET).update(id).digest("hex").slice(0, 24);
+  return `${id}.${sig}`;
+}
+
+function verifyState(state: unknown): string | null {
+  const [id, sig] = String(state || "").split(".");
+  if (!id || !sig) return null;
+  const expected = crypto.createHmac("sha256", OAUTH_STATE_SECRET).update(id).digest("hex").slice(0, 24);
+  const a = Buffer.from(sig), b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? id : null;
+}
+
 
 const chatQueues = new Map<string, Promise<void>>();
 
@@ -771,7 +802,17 @@ async function sendRemindersList(chatId: string | number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function sendAuthPrompt(chatId: string | number): Promise<void> {
-  const authUrl = getAuthUrl(String(chatId));
+
+const authUrl = getAuthUrl(signState(chatId));
+
+if (MAX_USERS > 0) {
+  const ids = getAllChatIds();
+  if (!ids.includes(String(chatId)) && ids.length >= MAX_USERS) {
+    await sendTelegramMessage(chatId, "🚧 Otis is full right now. Please try again later.");
+    return;
+  }
+}
+
   try {
     await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, {
       chat_id: chatId,
@@ -993,6 +1034,7 @@ interface PromptParams {
   locationPayload?: { latitude: number; longitude: number } | null;
   // silent = scheduled/proactive run: no "thinking" message, no error message,
   // and nothing is sent if the agent replies [NO_ALERT]
+  documentPayload?: any;
   silent?: boolean;
   // text put in front of the agent's reply (e.g. "☀️ Morning Briefing")
   header?: string;
@@ -1004,7 +1046,7 @@ function processUserPrompt(params: PromptParams): Promise<void> {
 }
 
 async function runAgent(params: PromptParams): Promise<void> {
-  const { chatId, promptText, tokens, audioPayload, imagePayload, locationPayload, silent = false, header } = params;
+const { chatId, promptText, tokens, audioPayload, imagePayload, documentPayload, locationPayload, silent = false, header } = params;
 
   let loaderMessageId: number | null = silent ? null : await sendTelegramMessage(chatId, "⚡ Otis is thinking...");
 
@@ -1018,6 +1060,7 @@ async function runAgent(params: PromptParams): Promise<void> {
         audio: audioPayload,
         image: imagePayload,
         location: locationPayload || undefined,
+        document: documentPayload,
       },
       { responseType: "stream" }
     );
@@ -1228,21 +1271,39 @@ const PROACTIVE: Record<ProactiveKind, { header: string; prompt: string }> = {
   },
 };
 
-async function runProactive(kind: ProactiveKind, chatIdOverride?: string | number, silent = true): Promise<void> {
-  const chatId = chatIdOverride ?? process.env.TELEGRAM_ALLOWED_USER_ID;
-  if (!chatId) {
-    console.log(`[PROACTIVE:${kind} SKIPPED] TELEGRAM_ALLOWED_USER_ID is missing in .env.`);
-    return;
-  }
 
+// ---- Users & preferences ----
+const PREFS_PATH = path.resolve(__dirname, "../prefs.json");
+interface UserPrefs { morning: boolean; wrapup: boolean; heartbeat: boolean }
+// heartbeat is off by default: it runs every 30 min per user, which is costly at scale
+const DEFAULT_PREFS: UserPrefs = { morning: true, wrapup: true, heartbeat: false };
+
+let prefsStore: Record<string, UserPrefs> = {};
+try { prefsStore = JSON.parse(fs.readFileSync(PREFS_PATH, "utf-8")); } catch {}
+
+function getPrefs(chatId: string | number): UserPrefs {
+  return { ...DEFAULT_PREFS, ...(prefsStore[String(chatId)] || {}) };
+}
+function setPref(chatId: string | number, key: keyof UserPrefs, value: boolean): void {
+  prefsStore[String(chatId)] = { ...getPrefs(chatId), [key]: value };
+  try { fs.writeFileSync(PREFS_PATH, JSON.stringify(prefsStore, null, 2)); } catch {}
+}
+
+// All chats that have connected Google (assumes tokens.json is { [chatId]: tokens })
+function getAllChatIds(): string[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(TOKENS_PATH, "utf-8"));
+    return Object.keys(raw).filter((id) => raw[id] && (raw[id].access_token || raw[id].refresh_token));
+  } catch {
+    return [];
+  }
+}
+
+async function runProactive(kind: ProactiveKind, chatId: string | number, silent = true): Promise<void> {
   const userTokens = getUserTokens(String(chatId));
   const hasUserTokens = Boolean(userTokens && (userTokens.access_token || userTokens.refresh_token));
-  if (!hasUserTokens) {
-    console.log(`[PROACTIVE:${kind} SKIPPED] No authenticated tokens for chat ${chatId}.`);
-    return;
-  }
+  if (!hasUserTokens) return;
 
-  console.log(`[PROACTIVE:${kind}] Running...`);
   await processUserPrompt({
     chatId,
     promptText: PROACTIVE[kind].prompt,
@@ -1252,21 +1313,30 @@ async function runProactive(kind: ProactiveKind, chatIdOverride?: string | numbe
   });
 }
 
+// Runs the routine for every opted-in user, a few at a time
+async function runProactiveForAll(kind: ProactiveKind): Promise<void> {
+  const ids = getAllChatIds().filter((id) => getPrefs(id)[kind]);
+  const CONCURRENCY = Number(process.env.PROACTIVE_CONCURRENCY || 3);
+  let next = 0;
+  const worker = async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      try { await runProactive(kind, id); }
+      catch (err: any) { console.error(`[PROACTIVE:${kind}] ${id}:`, err?.message || err); }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, ids.length) }, worker));
+}
+
 function scheduleProactive(expr: string, kind: ProactiveKind): void {
   if (!PROACTIVE_ENABLED) return;
-  if (!cron.validate(expr)) {
-    console.error(`[PROACTIVE] Invalid cron expression for ${kind}: "${expr}"`);
-    return;
-  }
-  cron.schedule(
-    expr,
-    () => {
-      runProactive(kind).catch((err) => console.error(`[PROACTIVE:${kind} ERROR]`, err?.message || err));
-    },
-    { timezone: TIMEZONE }
-  );
-  console.log(`[PROACTIVE] ${kind} scheduled: "${expr}" (${TIMEZONE})`);
+  if (!cron.validate(expr)) { console.error(`[PROACTIVE] Invalid cron for ${kind}: "${expr}"`); return; }
+  cron.schedule(expr, () => {
+    runProactiveForAll(kind).catch((err) => console.error(`[PROACTIVE:${kind} ERROR]`, err?.message || err));
+  }, { timezone: TIMEZONE });
 }
+
+
 
 scheduleProactive(MORNING_CRON, "morning");
 scheduleProactive(HEARTBEAT_CRON, "heartbeat");
@@ -1278,11 +1348,10 @@ scheduleProactive(WRAPUP_CRON, "wrapup");
 
 app.get("/auth/google/callback", async (req: Request, res: Response) => {
   const code = req.query.code as string;
-  const chatId = req.query.state as string;
-
-  if (!code || !chatId) {
-    return res.status(400).send("<h3>Missing authorization code or chat state.</h3>");
-  }
+const chatId = verifyState(req.query.state);
+if (!code || !chatId) {
+  return res.status(400).send("<h3>Invalid or missing authorization state.</h3>");
+}
 
   try {
     const { tokens: tokenData } = await oauth2Client.getToken(code);
@@ -1332,6 +1401,9 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
     const chatId = cq.message?.chat?.id;
 
     console.log(`\n🔘 [BUTTON CLICK DETECTED] callback_data: "${data}" from chat: ${chatId}`);
+
+     if (cq.message?.chat?.type !== "private") { await answerCallbackQuery(cq.id); return; }
+    if (chatId && isRateLimited(chatId)) { await answerCallbackQuery(cq.id, "Slow down a little 🙂"); return; }
 
     // 1a. Menu navigation (menu:main | menu:compact | menu:<category>)
     if (data.startsWith("menu:")) {
@@ -1445,6 +1517,11 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
       return;
     }
 
+    if (String(pending.chatId) !== String(chatId)) {
+  await answerCallbackQuery(cq.id, "Not your draft.", true);
+  return;
+}
+
     if (actionType === "cancel") {
       console.log(`❌ [ACTION CANCELLED] actionId: ${actionId}`);
       pendingActions.delete(actionId);
@@ -1556,6 +1633,9 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
   const msg = body.message;
   const chatId = msg.chat.id;
 
+  if (msg.chat.type !== "private") return; 
+if (isRateLimited(chatId)) return;
+
   const tokens = getUserTokens(String(chatId)) || {};
   const hasTokens = Boolean(tokens && (tokens.access_token || tokens.refresh_token));
 
@@ -1605,6 +1685,20 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
       return;
     }
 
+    if (cmd.startsWith("/notify")) {
+  const [, what, state] = cmd.split(/\s+/);
+  const keys = ["morning", "wrapup", "heartbeat"] as const;
+  if (what && (keys as readonly string[]).includes(what) && (state === "on" || state === "off")) {
+    setPref(chatId, what as keyof UserPrefs, state === "on");
+  }
+  const p = getPrefs(chatId);
+  await sendTelegramMessage(
+    chatId,
+    `🔔 *Notifications*\n☀️ morning: ${p.morning ? "on" : "off"}\n🌙 wrapup: ${p.wrapup ? "on" : "off"}\n📡 heartbeat: ${p.heartbeat ? "on" : "off"}\n\nChange with e.g. \`/notify heartbeat on\``
+  );
+  return;
+}
+
     if (cmd === "/check") {
       pendingInputs.delete(String(chatId));
       await processUserPrompt({ chatId, promptText: ITEMS.check.prompt, tokens });
@@ -1641,6 +1735,7 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
   let promptText = msg.text || msg.caption || "";
   let audioPayload: any = null;
   let imagePayload: any = null;
+  let documentPayload: any = null;
   let locationPayload: { latitude: number; longitude: number } | null = null;
 
   // Polls forwarded TO the bot
@@ -1708,16 +1803,35 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
 }
   }
 
-  if (!promptText && !audioPayload && !imagePayload && !locationPayload) return;
+  if (msg.document) {
+  if ((msg.document.file_size || 0) > 20 * 1024 * 1024) {
+    await sendTelegramMessage(chatId, "⚠️ That file is over 20 MB (Telegram's bot limit).");
+    return;
+  }
+  try {
+    const fileRes = await axios.get(`${TELEGRAM_API_BASE}/getFile?file_id=${msg.document.file_id}`);
+    const filePath = fileRes.data?.result?.file_path;
+    const dl = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, { responseType: "arraybuffer" });
+    documentPayload = {
+      data: Buffer.from(dl.data).toString("base64"),
+      mime_type: msg.document.mime_type || "application/octet-stream",
+      filename: msg.document.file_name || "document",
+    };
+    if (!promptText) promptText = `I sent a file named "${documentPayload.filename}". Ask me what to do with it.`;
+  } catch (e: any) {
+    await sendTelegramMessage(chatId, "⚠️ I couldn't download that file. Please try again.");
+    return;
+  }
+}
 
-  await processUserPrompt({
-    chatId,
-    promptText,
-    tokens,
-    audioPayload,
-    imagePayload,
-    locationPayload,
-  });
+// update the empty-message guard
+if (!promptText && !audioPayload && !imagePayload && !documentPayload && !locationPayload) return;
+
+
+
+
+ await processUserPrompt({ chatId, promptText, tokens, audioPayload, imagePayload, documentPayload, locationPayload });
+ 
 });
 
 // ---------------------------------------------------------------------------
