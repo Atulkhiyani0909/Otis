@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import FormData from "form-data";
 import { createParser, type EventSourceMessage } from "eventsource-parser";
-import { saveUserTokens, getUserTokens } from "./tokenStore.js";
+import { saveUserTokens, getUserTokens ,deleteUserTokens ,TOKEN_FILE_PATH } from "./tokenStore.js";
 import { getAuthUrl, oauth2Client } from "./googleAuth.js";
 import fs from "fs";
 import path from "path";
@@ -26,7 +26,7 @@ const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL || "https://otis-6nhk.onre
 const PYTHON_BASE_URL = PYTHON_AGENT_URL.replace(/\/api\/agent\/dispatch.*$/, "");
 const PYTHON_CONFIRM_URL = `${PYTHON_BASE_URL}/api/agent/confirm-action`;
 
-const TOKENS_PATH = path.resolve(__dirname, "../tokens.json");
+
 const POLLS_PATH = path.resolve(__dirname, "../polls.json");
 
 // Optional: public URL of this gateway, e.g. https://xyz.ngrok.app
@@ -341,6 +341,7 @@ function buildMainMenu() {
       2
     )
   );
+  rows.push([{ text: "🚪 Logout", callback_data: "logout:ask" }]);
   rows.push([{ text: "✖ Close", callback_data: "menu:compact" }]);
   return { inline_keyboard: rows };
 }
@@ -802,6 +803,26 @@ async function sendRemindersList(chatId: string | number): Promise<void> {
 // ---------------------------------------------------------------------------
 // Google Auth Prompt Helper
 // ---------------------------------------------------------------------------
+
+async function sendLogoutWarning(chatId: string | number): Promise<void> {
+  await sendTelegramMessage(
+    chatId,
+    "⚠️ *Logout Warning*\n\n" +
+      "This will disconnect your Google account from Otis and delete your saved access token.\n\n" +
+      "• Otis will no longer be able to access Gmail, Calendar, Drive, Sheets or Tasks\n" +
+      "• Morning/wrap-up briefings and scheduled tasks that need Google will stop working\n" +
+      "• Any pending email drafts will be discarded\n\n" +
+      "You can reconnect any time with /login.\n\nAre you sure?",
+    {
+      inline_keyboard: [
+        [
+          { text: "🚪 Yes, log me out", callback_data: "logout:yes" },
+          { text: "❌ Cancel", callback_data: "logout:no" },
+        ],
+      ],
+    }
+  );
+}
 
 async function sendAuthPrompt(chatId: string | number): Promise<void> {
 
@@ -1294,7 +1315,7 @@ function setPref(chatId: string | number, key: keyof UserPrefs, value: boolean):
 // All chats that have connected Google (assumes tokens.json is { [chatId]: tokens })
 function getAllChatIds(): string[] {
   try {
-    const raw = JSON.parse(fs.readFileSync(TOKENS_PATH, "utf-8"));
+    const raw = JSON.parse(fs.readFileSync(TOKEN_FILE_PATH, "utf-8"));
     return Object.keys(raw).filter((id) => raw[id] && (raw[id].access_token || raw[id].refresh_token));
   } catch {
     return [];
@@ -1382,7 +1403,7 @@ app.get("/terms", (req, res) => {
   res.send(layout("Terms of Service - Otis Assistant", "The terms that apply when you use Otis Assistant.", termsBody()));
 });
 
-app.listen(PORT);
+
 
 app.get("/auth/google/callback", async (req: Request, res: Response) => {
   const code = req.query.code as string;
@@ -1491,6 +1512,58 @@ app.post("/webhook/telegram", async (req: Request, res: Response) => {
       } else if (action === "del") {
         removeReminder(remId);
         if (messageId) await editTelegramMessage(chatId, messageId, `🗑 Deleted: ${r.message}`);
+      }
+      return;
+    }
+
+        // Logout flow (logout:ask | logout:yes | logout:no)
+    if (data.startsWith("logout:")) {
+      const action = data.split(":")[1];
+      await answerCallbackQuery(cq.id);
+      if (!chatId) return;
+
+      if (action === "ask") {
+        await sendLogoutWarning(chatId);
+        return;
+      }
+
+      if (action === "no") {
+        if (messageId) await editTelegramMessage(chatId, messageId, "✅ Logout cancelled. You're still connected.", buildCompactMenu());
+        return;
+      }
+
+      if (action === "yes") {
+        const tk = getUserTokens(String(chatId)) || {};
+
+        // Best effort: also revoke access at Google
+        const tokenToRevoke = tk.refresh_token || tk.access_token;
+        if (tokenToRevoke) {
+          try { await oauth2Client.revokeToken(tokenToRevoke); }
+          catch (e: any) { console.error("[LOGOUT] Google revoke failed:", e?.message || e); }
+        }
+
+        const removed = deleteUserTokens(String(chatId));
+
+        for (const r of [...reminders.values()]) {
+  if (String(r.chatId) === String(chatId)) removeReminder(r.id);
+}
+
+        // Clear anything tied to the old session
+        pendingInputs.delete(String(chatId));
+        for (const [id, a] of pendingActions) {
+          if (String(a.chatId) === String(chatId)) pendingActions.delete(id);
+        }
+
+        console.log(`[LOGOUT] chat ${chatId} removed=${removed}`);
+        if (messageId) {
+          await editTelegramMessage(
+            chatId,
+            messageId,
+            removed
+              ? "🚪 *Logged out.* Your Google token has been deleted.\n\nSend /login to connect again."
+              : "⚠️ Couldn't find a saved login for this chat."
+          );
+        }
       }
       return;
     }
@@ -1682,6 +1755,15 @@ if (isRateLimited(chatId)) return;
       await sendAuthPrompt(chatId);
     } else {
       await sendQuickMenu(chatId, "👋 Otis online. Pick a tool below or just tell me what you need.");
+    }
+    return;
+  }
+
+    if (msg.text === "/logout") {
+    if (!hasTokens) {
+      await sendTelegramMessage(chatId, "You're not connected to Google. Send /login to connect.");
+    } else {
+      await sendLogoutWarning(chatId);
     }
     return;
   }

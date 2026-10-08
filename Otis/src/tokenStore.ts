@@ -3,7 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import { config } from "./config.js";
 
-const TOKEN_FILE_PATH = path.resolve(process.cwd(), "tokens.json");
+export const TOKEN_FILE_PATH = path.resolve(process.cwd(), "tokens.json");
 const ALGORITHM = "aes-256-gcm";
 
 interface StoredTokens {
@@ -71,5 +71,24 @@ export function getUserTokens(chatId: string): StoredTokens | null {
   } catch (error) {
     console.error("Error reading or decrypting user tokens:", error);
     return null;
+  }
+}
+
+
+export function deleteUserTokens(chatId: string): boolean {
+  if (!fs.existsSync(TOKEN_FILE_PATH)) return false;
+
+  try {
+    const allTokens: Record<string, string> = JSON.parse(
+      fs.readFileSync(TOKEN_FILE_PATH, "utf8")
+    );
+    if (!(chatId in allTokens)) return false;
+
+    delete allTokens[chatId];
+    fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(allTokens, null, 2), "utf8");
+    return true;
+  } catch (error) {
+    console.error("Error deleting user tokens:", error);
+    return false;
   }
 }
