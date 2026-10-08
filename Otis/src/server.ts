@@ -20,7 +20,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 // Dynamic agent URLs
-const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL || "http://127.0.0.1:8000/api/agent/dispatch";
+const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL || "https://otis-6nhk.onrender.com/api/agent/dispatch";
 const PYTHON_BASE_URL = PYTHON_AGENT_URL.replace(/\/api\/agent\/dispatch.*$/, "");
 const PYTHON_CONFIRM_URL = `${PYTHON_BASE_URL}/api/agent/confirm-action`;
 
@@ -1345,6 +1345,13 @@ scheduleProactive(WRAPUP_CRON, "wrapup");
 // ---------------------------------------------------------------------------
 // OAuth Callback Route
 // ---------------------------------------------------------------------------
+
+app.get("/health",(req:Request,res:Response)=>{
+res.send({
+  "ready":"Main Server is Up to Date",
+  "success":"True"
+})
+})
 
 app.get("/auth/google/callback", async (req: Request, res: Response) => {
   const code = req.query.code as string;
