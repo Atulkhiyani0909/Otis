@@ -16,8 +16,12 @@ export const CONFIG = {
   // List the Google data your app really accesses. Google compares this
   // against the OAuth scopes you request, so keep them in sync.
   googleData: [
-    "Google Calendar: view and create events so Otis can manage your schedule",
-    "Gmail: read and send emails on your instruction (remove this line if unused)",
+    "Google Calendar: view, create and edit events so Otis Assistant can manage your schedule",
+    "Gmail: read emails and send or draft emails on your instruction",
+    "Google Drive: find, read and create files on your instruction",
+    "Google Sheets: read and update spreadsheets on your instruction",
+    "Google Contacts: look up contact names, emails and phone numbers when you ask Otis Assistant to contact someone",
+    "Google Tasks: view, create and complete tasks on your instruction",
     "Basic profile: your name and email address, used to identify your account",
   ],
 };
@@ -222,8 +226,8 @@ export function homeBody(): string {
       <h1>${CONFIG.appName} handles the admin so you can get on with the work.</h1>
       <p>
         ${CONFIG.appName} is a personal executive assistant that lives in Telegram.
-        Message it in plain language to manage your calendar, draft emails and
-        keep track of what needs doing.
+        Message it in plain language to manage your calendar, email, files, spreadsheets,
+        contacts and tasks.
       </p>
       <a class="btn" href="${TELEGRAM_URL}" target="_blank" rel="noopener noreferrer">
         Open ${CONFIG.appName} in Telegram
