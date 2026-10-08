@@ -1367,15 +1367,19 @@ app.get("/googlea080b99fe92b7b48.html", (req, res) => {
 
 
 app.get("/", (req, res) => {
-  res.send(layout("Otis - Personal assistant on Telegram", "Otis is a personal executive assistant on Telegram.", homeBody()));
+  res.send(layout(
+    "Otis Assistant - Personal assistant on Telegram",
+    "Otis Assistant is a personal executive assistant on Telegram.",
+    homeBody()
+  ));
 });
 
 app.get("/privacy-policy", (req, res) => {
-  res.send(layout("Privacy Policy - Otis", "How Otis collects, uses and protects your data.", privacyBody()));
+  res.send(layout("Privacy Policy - Otis Assistant", "How Otis Assistant collects, uses and protects your data.", privacyBody()));
 });
 
 app.get("/terms", (req, res) => {
-  res.send(layout("Terms of Service - Otis", "The terms that apply when you use Otis.", termsBody()));
+  res.send(layout("Terms of Service - Otis Assistant", "The terms that apply when you use Otis Assistant.", termsBody()));
 });
 
 app.listen(PORT);
